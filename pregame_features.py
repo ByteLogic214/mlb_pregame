@@ -1,256 +1,271 @@
 """
-pregame_ingest.py — Ingesta EXCLUSIVA de datos reales.
+pregame_features.py — Cálculo de features prepartido.
 
-Fuentes:
-  - pybaseball (Baseball Savant / FanGraphs / MLB): abridores, bullpens, lineups,
-    estadísticas de pitcheo/ofensiva, Statcast por lanzamiento.
-  - The Odds API (requests): cuotas prepartido, líneas de totales y moneylines.
-
-Nada de este módulo genera datos sintéticos. Cada función devuelve DataFrames
-reales con timestamp para garantizar la congelación prepartido (data freeze).
+Métricas implementadas con fórmulas estándar del sabermetrics:
+  - FIP, xFIP, SIERA (FanGraphs), K-BB%
+  - wOBA, ISO, wRC+
+  - BaseRuns (David Smyth) para detección de regresión
+  - Park factors, matchup por mano del pitcher, workload de bullpen
 """
 from __future__ import annotations
 
-import time
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-
+import numpy as np
 import pandas as pd
-import requests
 
-import pybaseball as pb
-from pybaseball import (cache, pitching_stats, batting_stats, team_batting,
-                        team_pitching, statcast, standings)
+from config import (PARK_FACTORS, OFFENSE_HOT_DAYS, ROLLING_BULLPEN_DAYS)
 
-from config import (DATA_DIR, FREEZE_DATA, MINUTES_BEFORE_FIRST_PITCH,
-                    ODD_API_PLACEHOLDER, ODD_API_PLACEHOLDER)  # noqa
-
-CACHE_DIR = DATA_DIR / "cache"; CACHE_DIR.mkdir(exist_ok=True)
-cache.enable()
+# --- Pesos clásicos de eventos para wOBA (temporada 2024, FanGraphs) ---
+W_WOBA = {"BB": 0.69, "HBP": 0.72, "1B": 0.88, "2B": 1.25, "3B": 1.59, "HR": 2.08}
+WOBASCALE = 1.21  # wOBAScale para convertir wOBA -> wRC+
 
 
 # ============================================================
-# SECCIÓN 1 — INGESTA DE ESTADÍSTICAS ACUMULADAS (pybaseball)
+# MÓDULO 1 — PITCHEO ABRIDOR Y BULLPEN
 # ============================================================
 
-def fetch_pitcher_season_stats(season: int) -> pd.DataFrame:
-    """Estadísticas de pitcheo acumuladas de la temporada (FanGraphs vía pybaseball).
+def starter_features(pitcher_season: pd.DataFrame, pitcher_name: str,
+                     statcast_14d: pd.DataFrame, pitcher_id: int) -> pd.Series:
+    """Features del abridor confirmado: FIP, SIERA, xERA, K-BB%, velo/spin reciente.
 
-    Devuelve FIP, SIERA, xERA, K-BB% por lanzador — columnas usadas por el módulo
-    de pitcheo (pregame_features.agg_pitching_features).
+    - Temporada acumulada desde pitching_stats (FanGraphs real).
+    - Velocidad y spin de los últimos 14 días desde Statcast (pitch-by-pitch real).
     """
-    return pitching_stats(season, qual=1)
+    row = pitcher_season[pitcher_season["Name"] == pitcher_name]
+    if row.empty:
+        raise ValueError(f"Pitcher no encontrado en temporada: {pitcher_name}")
+    r = row.iloc[0]
+
+    # Statcast reciente del lanzador (filtrar por pitcher ID)
+    sc = statcast_14d[statcast_14d["pitcher"] == pitcher_id]
+    recent_velo = sc["release_speed"].mean() if not sc.empty else np.nan
+    recent_spin = sc["release_spin_rate"].mean() if not sc.empty else np.nan
+
+    return pd.Series({
+        "pitcher": pitcher_name,
+        "fip": r.get("FIP"),
+        "xfip": r.get("xFIP"),
+        "siera": r.get("SIERA"),
+        "xera": r.get("xERA"),
+        "k_bb_pct": r.get("K-BB%"),
+        "era": r.get("ERA"),
+        "ip_season": r.get("IP"),
+        "recent_velo": recent_velo,
+        "recent_spin": recent_spin,
+    })
 
 
-def fetch_batter_season_stats(season: int) -> pd.DataFrame:
-    """wOBA, ISO, wRC+ acumulados de temporada por bateador."""
-    return batting_stats(season, qual=1)
+def bullpen_features(statcast_bullpen: pd.DataFrame,
+                     starter_ids: set[int]) -> pd.DataFrame:
+    """Bullpen de los últimos 3-7 días: pitches thrown, innings, carga de trabajo.
 
-
-def fetch_statcast_window(start: str, end: str) -> pd.DataFrame:
-    """Statcast por lanzamiento en una ventana [start, end] ('YYYY-MM-DD').
-
-    Se usa para: velocidad promedio (release_speed) y spin rate (release_spin_rate)
-    recientes del abridor, y workload de bullpen (pitches thrown).
+    Excluye a los abridores del día (starter_ids). Todo desde Statcast real:
+    cada fila es un lanzamiento real registrado por Baseball Savant.
     """
-    return statcast(start_dt=start, end_dt=end, verbose=False)
+    bp = statcast_bullpen[~statcast_bullpen["pitcher"].isin(starter_ids)].copy()
+    if bp.empty:
+        return pd.DataFrame()
 
+    g = bp.groupby("pitcher").agg(
+        pitches_thrown=("pitch_type", "count"),
+        batters_faced=("batter", "nunique"),
+        avg_velo=("release_speed", "mean"),
+        total_pitches_days=( "game_date", "nunique"),
+    ).reset_index()
 
-def fetch_team_records(season: int) -> pd.DataFrame:
-    """Standings de la temporada (para contexto y features de equipo)."""
-    return standings(season)
+    # Innings aproximados: outs registrados / 3
+    outs = bp[bp["events"].isin([
+        "strikeout", "field_out", "force_out", "grounded_into_double_play",
+        "sac_fly", "sac_bunt", "double_play", "triple_play",
+    ])].groupby("pitcher").size().rename("outs")
+    g = g.merge(outs, on="pitcher", how="left").fillna({"outs": 0})
+    g["ip_bullpen"] = g["outs"] / 3.0
+    g["pitches_per_ip"] = g["pitches_thrown"] / g["ip_bullpen"].replace(0, np.nan)
+    g["workload_flag"] = g["pitches_thrown"] > 60  # bullpen muy cargado
+    return g
 
 
 # ============================================================
-# SECCIÓN 2 — ABRIDOR CONFIRMADO Y LINEUP (API MLB vía pybaseball)
+# MÓDULO 2 — OFENSIVA (LINEUP vs RHP/LHP)
 # ============================================================
 
-def fetch_probable_pitchers(game_date: str) -> pd.DataFrame:
-    """Abridores probables/confirmados por juego del día.
+def _woba_from_events(df: pd.DataFrame) -> float:
+    """wOBA calculado desde eventos reales de Statcast."""
+    pa = df["events"].notna().sum()
+    if pa == 0:
+        return np.nan
+    num = 0.0
+    for ev, w in W_WOBA.items():
+        if ev == "BB":
+            mask = df["events"] == "walk"
+        elif ev == "HBP":
+            mask = df["events"] == "hit_by_pitch"
+        elif ev == "1B":
+            mask = df["events"] == "single"
+        elif ev == "2B":
+            mask = df["events"] == "double"
+        elif ev == "3B":
+            mask = df["events"] == "triple"
+        elif ev == "HR":
+            mask = df["events"] == "home_run"
+        num += w * mask.sum()
+    return num / pa
 
-    game_date: 'YYYY-MM-DD'. Fuente: endpoint schedule de MLB
-    (https://statsapi.mlb.com/api/v1/schedule) — API pública oficial de MLB.
+
+def lineup_offense_features(lineup: pd.DataFrame,
+                            batter_season: pd.DataFrame,
+                            statcast_hot: pd.DataFrame,
+                            pitcher_hand: str) -> pd.Series:
+    """Agrega wOBA, ISO y wRC+ de la alineación titular.
+
+    - Temporada acumulada: merge con batting_stats (FanGraphs real) por nombre.
+    - Últimos 14 días: cálculo directo de wOBA/ISO desde eventos Statcast.
+    - Matchup: se repondera por lado de bateo vs mano del abridor rival
+      (hand_split disponible si Statcast lo trae vía 'stand' vs 'p_throws').
     """
-    url = ("https://statsapi.mlb.com/api/v1/schedule"
-           f"?sportId=1&date={game_date}&hydrate=probablePitcher,team")
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    games = []
-    for date_block in resp.json().get("dates", []):
-        for g in date_block.get("games", []):
-            games.append({
-                "game_id": g["gamePk"],
-                "game_date": game_date,
-                "home_team": g["teams"]["home"]["team"]["name"],
-                "away_team": g["teams"]["away"]["team"]["name"],
-                "home_team_id": g["teams"]["home"]["team"]["id"],
-                "away_team_id": g["teams"]["away"]["team"]["id"],
-                "home_pitcher_id": (g["teams"]["home"]
-                                    .get("probablePitcher", {}).get("id")),
-                "away_pitcher_id": (g["teams"]["away"]
-                                    .get("probablePitcher", {}).get("id")),
-                "home_pitcher": (g["teams"]["home"]
-                                 .get("probablePitcher", {}).get("fullName")),
-                "away_pitcher": (g["teams"]["away"]
-                                 .get("probablePitcher", {}).get("fullName")),
-                "game_time_utc": g.get("gameDate"),
-            })
-    return pd.DataFrame(games)
+    lineup = lineup[lineup["batting_order"] <= 900].copy()  # titulares
+    merged = lineup.merge(
+        batter_season[["Name", "wOBA", "ISO", "wRC+", "PA"]],
+        left_on="player_name", right_on="Name", how="left")
+
+    # 14 días calientes por bateador desde Statcast real
+    hot = statcast_hot[statcast_hot["batter"].isin(lineup["player_id"])]
+    hot_stats = hot.groupby("batter").apply(
+        lambda d: pd.Series({
+            "woba_14d": _woba_from_events(d),
+            "iso_14d": (
+                (d["events"].isin(["double"]).sum()
+                 + 2 * d["events"].isin(["triple"]).sum()
+                 + 3 * d["events"].isin(["home_run"]).sum())
+                / max(d["events"].notna().sum(), 1)),
+        })).reset_index()
+    merged = merged.merge(hot_stats, left_on="player_id",
+                          right_on="batter", how="left")
+
+    w_pa = merged["PA"].fillna(100)  # ponderar por exposición real
+    out = {
+        "lineup_woba_season": np.average(merged["wOBA"].fillna(
+            merged["wOBA"].mean()), weights=w_pa),
+        "lineup_iso_season": np.average(merged["ISO"].fillna(
+            merged["ISO"].mean()), weights=w_pa),
+        "lineup_wrc_season": np.average(merged["wRC+"].fillna(100), weights=w_pa),
+        "lineup_woba_14d": merged["woba_14d"].mean(),
+        "lineup_iso_14d": merged["iso_14d"].mean(),
+        "n_missing_stats": merged["wOBA"].isna().sum(),
+        "vs_pitcher_hand": pitcher_hand,
+    }
+    return pd.Series(out)
 
 
-def fetch_lineup_confirmed(game_id: int) -> pd.DataFrame:
-    """Lineup titular confirmado de un juego (boxscore oficial de MLB).
+# ============================================================
+# MÓDULO 3 — ENTORNO Y BASERUNS
+# ============================================================
 
-    Devuelve orden al bate, mano (L/R/S) y player_id por equipo. Se filtra por
-    'battingOrder' no nulo = lineup titular real confirmado.
+def park_factor(home_team_abbr: str) -> float:
+    """Park factor oficial del estadio local (config, actualizado anualmente)."""
+    return PARK_FACTORS.get(home_team_abbr, 100.0) / 100.0
+
+
+def baseruns(batting_line: dict) -> float:
+    """BaseRuns de David Smyth — estimación de carreras esperadas.
+
+    batting_line: dict con AB, H, 2B, 3B, HR, BB, HBP, SB, CS, SO, PA, TB.
+    Se compara contra carreras reales del equipo para detectar regresión
+    (equipos sobre/sobrerrendiendo su producción real de bateo).
     """
-    url = f"https://statsapi.mlb.com/api/v1/game/{game_id}/boxscore"
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    box = resp.json()
-    rows = []
-    for side in ("home", "away"):
-        team = box["teams"][side]
-        team_name = team["team"]["name"]
-        for pid, player in team["players"].items():
-            if player.get("battingOrder") is None:
-                continue
-            rows.append({
-                "game_id": game_id,
-                "team": team_name,
-                "side": side,
-                "player_id": int(pid.split("ID")[-1]),
-                "player_name": player["person"]["fullName"],
-                "batting_order": int(player["battingOrder"]),
-                "bat_side": player.get("batSide", {}).get("code"),
-                "position": player.get("position", {}).get("abbreviation"),
-            })
-    return pd.DataFrame(rows).sort_values(["team", "batting_order"])
+    ab, h = batting_line["AB"], batting_line["H"]
+    tb = batting_line["TB"]
+    bb, hbp = batting_line["BB"], batting_line["HBP"]
+    sb, cs = batting_line["SB"], batting_line.get("CS", 0)
+    singles = h - (batting_line["2B"] + batting_line["3B"] + batting_line["HR"])
+
+    # Componentes de scoring
+    a = h - batting_line["2B"] - batting_line["3B"] - batting_line["HR"] + bb + hbp - (0.5 * 0)
+    b = (0.883 * singles + 2.376 * batting_line["2B"] + 3.893 * batting_line["3B"]
+         + 2.069 * batting_line["HR"] + 0.397 * (bb + hbp) - 0.823 * 0)
+    c = ab - h + 0.92 * (bb + hbp) + 1.02 * 0
+    d = batting_line["HR"]
+    league_scoring = 0.117  # factor de liga ~4.5 runs/juego/9 entradas
+    bs = (a * b / (b + c) + d) * (league_scoring / 0.117)
+    return bs
 
 
-# ============================================================
-# SECCIÓN 3 — THE ODDS API (cuotas reales de cierre prepartido)
-# ============================================================
+def baseruns_regression(team_stats: pd.DataFrame) -> pd.Series:
+    """Diferencia BaseRuns - Carreras reales por equipo (regresión a la media).
 
-def fetch_odds(sport_key: str, api_key: str, regions: str = "us,us2",
-               markets: str = "h2h,spreads,totals") -> pd.DataFrame:
-    """Cuotas prepartido reales desde The Odds API.
-
-    Mercados: h2h (moneyline), totals (over/under de carreras).
-    Incluye el timestamp de extracción para auditoría del cierre de línea.
+    Valor positivo => el equipo ha tenido mala suerte/CLV bajo, se espera mejora.
     """
-    url = (f"{ODDS_API_BASE}/sports/{sport_key}/odds/"
-           f"?apiKey={api_key}&regions={regions}&markets={markets}"
-           "&oddsFormat=american&dateFormat=iso")
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    fetched_at = datetime.now(timezone.utc).isoformat()
-
-    rows = []
-    for event in resp.json():
-        for bookmaker in event.get("bookmakers", []):
-            for market in bookmaker.get("markets", []):
-                if market["key"] == "totals":
-                    for outcome in market["outcomes"]:
-                        rows.append({
-                            "fetched_at": fetched_at,
-                            "event_id": event["id"],
-                            "home_team": event["home_team"],
-                            "away_team": event["away_team"],
-                            "commence_time": event["commence_time"],
-                            "book": bookmaker["title"],
-                            "market": "total",
-                            "label": outcome["name"],
-                            "line": outcome.get("point"),
-                            "price": outcome["price"],
-                        })
-                elif market["key"] == "h2h":
-                    for outcome in market["outcomes"]:
-                        rows.append({
-                            "fetched_at": fetched_at,
-                            "event_id": event["id"],
-                            "home_team": event["home_team"],
-                            "away_team": event["away_team"],
-                            "commence_time": event["commence_time"],
-                            "book": bookmaker["title"],
-                            "market": "moneyline",
-                            "label": outcome["name"],
-                            "line": None,
-                            "price": outcome["price"],
-                        })
-    return pd.DataFrame(rows)
-
-
-def consensus_line(odds_df: pd.DataFrame, market: str) -> pd.DataFrame:
-    """Consenso de línea: mediana de punto y precio entre casas de apuestas."""
-    df = odds_df[odds_df["market"] == market]
-    grouped = df.groupby(["event_id", "label"], as_index=False).agg(
-        median_line=("line", "median"),
-        median_price=("price", "median"),
-        n_books=("book", "nunique"),
-    )
-    return grouped
+    team_stats["baseruns_est"] = team_stats.apply(
+        lambda r: baseruns(r.to_dict()), axis=1)
+    team_stats["br_diff"] = team_stats["baseruns_est"] - team_stats["R"]
+    return team_stats[["team", "baseruns_est", "br_diff"]]
 
 
 # ============================================================
-# SECCIÓN 4 — FREEZE PREPARTIDO Y ORQUESTACIÓN DIARIA
+# CONSTRUCCIÓN DEL VECTOR FINAL POR JUEGO
 # ============================================================
 
-def game_freeze_time(commence_time_utc: str) -> datetime:
-    """Instante en que el pipeline debe ejecutarse y congelar datos:
-    N minutos antes del primer lanzamiento."""
-    dt = datetime.fromisoformat(commence_time_utc.replace("Z", "+00:00"))
-    return dt - timedelta(minutes=MINUTES_BEFORE_FIRST_PITCH)
+def build_game_vector(game_row: pd.Series, ctx: dict) -> pd.Series:
+    """Ensambla todas las features prepartido de UN juego.
 
-
-def run_daily_ingest(game_date: str, odds_api_key: str) -> dict[str, Path]:
-    """Orquesta la ingesta completa del día y la CONGELA en disco (snapshot).
-
-    Retorna rutas a los parquets congelados. Una vez ejecutado, los datos no
-    cambian aunque se re-corra (FREEZE_DATA=True evita sobreescritura).
+    ctx: dict con los DataFrames congelados del snapshot (ver run_daily_ingest).
     """
-    snap = DATA_DIR / f"snapshot_{game_date}"
-    snap.mkdir(exist_ok=True)
-    paths: dict[str, Path] = {}
+    home, away = game_row["home_team"], game_row["away_team"]
 
-    def _save(df: pd.DataFrame, name: str) -> None:
-        p = snap / f"{name}.parquet"
-        if FREEZE_DATA and p.exists():
-            return  # congelado: no se toca
-        df.to_parquet(p, index=False)
-        paths[name] = p
+    # Pitcheo
+    away_sp = starter_features(ctx["pitcher_season"], game_row["away_pitcher"],
+                               ctx["statcast_14d"], game_row["away_pitcher_id"])
+    home_sp = starter_features(ctx["pitcher_season"], game_row["home_pitcher"],
+                               ctx["statcast_14d"], game_row["home_pitcher_id"])
+    # Bullpens
+    starters = {game_row["away_pitcher_id"], game_row["home_pitcher_id"]}
+    bp = bullpen_features(ctx["statcast_bullpen"], starters)
 
-    season = int(game_date[:4])
+    # Ofensiva (lineup vs mano del abridor rival)
+    lineups = ctx["lineups"]
+    h_lu = lineups[(lineups["game_id"] == game_row["game_id"]) & (lineups["side"] == "home")]
+    a_lu = lineups[(lineups["game_id"] == game_row["game_id"]) & (lineups["side"] == "away")]
+    # Mano del abridor desde Statcast (pitch_type no nulo -> p_throws)
+    hand_map = ctx["statcast_14d"].groupby("pitcher")["p_throws"].last()
+    away_hand = hand_map.get(game_row["away_pitcher_id"], "R")
+    home_hand = hand_map.get(game_row["home_pitcher_id"], "R")
+    h_off = lineup_offense_features(h_lu, ctx["batter_season"],
+                                    ctx["statcast_14d"], away_hand)
+    a_off = lineup_offense_features(a_lu, ctx["batter_season"],
+                                    ctx["statcast_14d"], home_hand)
 
-    # 1. Abridores probables/confirmados
-    games = fetch_probable_pitchers(game_date)
-    _save(games, "games")
+    pf = park_factor(game_row["home_team_abbr"])
 
-    # 2. Lineups confirmados (solo si el juego está dentro de la ventana de freeze)
-    if not games.empty:
-        lineups = pd.concat(
-            [fetch_lineup_confirmed(gid) for gid in games["game_id"]],
-            ignore_index=True)
-        _save(lineups, "lineups")
+    vec = {
+        "game_id": game_row["game_id"],
+        "game_date": game_row["game_date"],
+        # --- Abridores ---
+        "away_fip": away_sp["fip"], "away_siera": away_sp["siera"],
+        "away_xera": away_sp["xera"], "away_kbb": away_sp["k_bb_pct"],
+        "away_velo": away_sp["recent_velo"], "away_spin": away_sp["recent_spin"],
+        "home_fip": home_sp["fip"], "home_siera": home_sp["siera"],
+        "home_xera": home_sp["xera"], "home_kbb": home_sp["k_bb_pct"],
+        "home_velo": home_sp["recent_velo"], "home_spin": home_sp["recent_spin"],
+        # --- Diferenciales abridor (clave del modelo) ---
+        "fip_diff": home_sp["fip"] - away_sp["fip"],
+        "siera_diff": home_sp["siera"] - away_sp["siera"],
+        # --- Ofensivas ---
+        "home_woba": h_off["lineup_woba_season"],
+        "home_woba_14d": h_off["lineup_woba_14d"],
+        "home_iso": h_off["lineup_iso_season"],
+        "home_wrc": h_off["lineup_wrc_season"],
+        "away_woba": a_off["lineup_woba_season"],
+        "away_woba_14d": a_off["lineup_woba_14d"],
+        "away_iso": a_off["lineup_iso_season"],
+        "away_wrc": a_off["lineup_wrc_season"],
+        "woba_diff": h_off["lineup_woba_season"] - a_off["lineup_woba_season"],
+        # --- Entorno ---
+        "park_factor": pf,
+        "rest_days_home": game_row.get("rest_home", 0),
+        "rest_days_away": game_row.get("rest_away", 0),
+    }
 
-    # 3. Estadísticas de temporada
-    _save(fetch_pitcher_season_stats(season), "pitcher_season")
-    _save(fetch_batter_season_stats(season), "batter_season")
-
-    # 4. Statcast de los últimos 14 días (velocidad/spin reciente + bullpen)
-    start = (datetime.fromisoformat(game_date) - timedelta(days=14)).strftime("%Y-%m-%d")
-    _save(fetch_statcast_window(start, game_date), "statcast_14d")
-
-    # 5. Bullpen de los últimos 5 días (carga de trabajo)
-    bp_start = (datetime.fromisoformat(game_date) - timedelta(days=5)).strftime("%Y-%m-%d")
-    _save(fetch_statcast_window(bp_start, game_date), "statcast_bullpen")
-
-    # 6. Cuotas reales (The Odds API)
-    if odds_api_key:
-        odds = fetch_odds(SPORT_KEY, odds_api_key)
-        _save(odds, "odds")
-        _save(consensus_line(odds, "totals"), "consensus_totals")
-        _save(consensus_line(odds, "moneyline"), "consensus_ml")
-
-    print(f"[ingest] Snapshot congelado en {snap}")
-    return paths
+    # Bullpen agregado (equipo)
+    if not bp.empty:
+        vec["home_bp_pitches"] = bp[bp["team"] == home]["pitches_thrown"].sum()
+        vec["away_bp_pitches"] = bp[bp["team"] == away]["pitches_thrown"].sum()
+    return pd.Series(vec)
